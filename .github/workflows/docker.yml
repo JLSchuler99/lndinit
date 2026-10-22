@@ -7,6 +7,15 @@ on:
   schedule:
     # Every day at 1AM (UTC).
     - cron: '0 1 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Already-published lndinit image version, e.g. v0.1.38-beta-lnd-v0.21.4-beta (a leading docker/ is stripped). Runs the regression only; nothing is built.'
+        required: true
+      force_fail:
+        description: 'Ask the regression run to fail (tests the red path)'
+        type: boolean
+        default: false
 
 defaults:
   run:
@@ -18,7 +27,12 @@ env:
 
 jobs:
   main:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: [self-hosted]
+    outputs:
+      release_version: ${{ steps.out.outputs.release_version }}
+      lnd_version: ${{ steps.out.outputs.lnd_version }}
+      digest: ${{ steps.out.outputs.digest }}
     steps:
       - name: Set up QEMU
         uses: lightninglabs/gh-actions/setup-qemu-action@39555064b3ae5c6d5c71a8ab304355faeaf3f4d4
@@ -74,3 +88,113 @@ jobs:
 
       - name: Image digest
         run: echo ${{ steps.docker_build.outputs.digest }}
+
+      - name: Set job outputs
+        id: out
+        run: |
+          echo "release_version=${RELEASE_VERSION}" >> $GITHUB_OUTPUT
+          echo "lnd_version=${BASE_IMAGE_VERSION}" >> $GITHUB_OUTPUT
+          echo "digest=${{ steps.docker_build.outputs.digest }}" >> $GITHUB_OUTPUT
+
+  regression:
+    needs: main
+    if: >-
+      !cancelled() &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && needs.main.result == 'success' &&
+      contains(github.ref_name, '-lnd-')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    permissions: {}
+    env:
+      GH_TOKEN: ${{ secrets.REGRESSION_DISPATCH_TOKEN }}
+      TARGET_REPO: ${{ vars.REGRESSION_TARGET_REPO || 'lightninglabs/lightning-infra' }}
+    steps:
+      - name: Resolve image
+        id: image
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          MAIN_VERSION: ${{ needs.main.outputs.release_version }}
+          MAIN_LND_VERSION: ${{ needs.main.outputs.lnd_version }}
+          MAIN_DIGEST: ${{ needs.main.outputs.digest }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            version="${INPUT_TAG#docker/}"
+            re='^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?-lnd-v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'
+            if [[ ! "$version" =~ $re ]]; then
+              echo "::error::'$version' is not an lndinit -lnd- version like v0.1.38-beta-lnd-v0.21.4-beta"
+              exit 1
+            fi
+            digest=$(docker buildx imagetools inspect "$DOCKER_REPO/$DOCKER_IMAGE:$version" \
+              --format '{{json .Manifest}}' | jq -r .digest)
+            lnd_version="${version#*-lnd-}"
+          else
+            version="$MAIN_VERSION"
+            lnd_version="$MAIN_LND_VERSION"
+            digest="$MAIN_DIGEST"
+          fi
+          if [[ "$version" != *-lnd-* || "$digest" != sha256:* ]]; then
+            echo "::error::need an -lnd- version and a digest, got '$version' '$digest'"
+            exit 1
+          fi
+          {
+            echo "tag=docker/$version"
+            echo "image=$DOCKER_REPO/$DOCKER_IMAGE:$version@$digest"
+            echo "lnd_version=$lnd_version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch and wait
+        env:
+          TAG: ${{ steps.image.outputs.tag }}
+          IMAGE: ${{ steps.image.outputs.image }}
+          LND_VERSION: ${{ steps.image.outputs.lnd_version }}
+          FORCE_FAIL: ${{ inputs.force_fail == true }}
+        run: |
+          cid="${GITHUB_REPOSITORY//\//-}-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          caller="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT"
+          jq -n --arg tag "$TAG" --arg image "$IMAGE" --arg lnd "$LND_VERSION" \
+            --arg caller "$caller" --arg cid "$cid" --argjson fail "$FORCE_FAIL" \
+            '{event_type: "lnd-regression", client_payload: {tag: $tag, image: $image,
+              lnd_version: $lnd, caller_run_url: $caller, correlation_id: $cid,
+              force_fail: $fail}}' |
+            gh api "repos/$TARGET_REPO/dispatches" --input -
+
+          deadline=$((SECONDS + 90 * 60))
+          find_deadline=$((SECONDS + 10 * 60))
+          run_id=
+          while (( SECONDS < deadline )); do
+            sleep 20
+            if [[ -z "$run_id" ]]; then
+              # Matches the receiver's file name; renaming it breaks this lookup.
+              run_id=$( (gh run list -R "$TARGET_REPO" --workflow lnd-regression.yaml \
+                --event repository_dispatch --limit 30 --json databaseId,displayTitle || true) |
+                jq -r --arg cid "$cid" 'first(.[] | select((.displayTitle // "") | endswith(" " + $cid)) | .databaseId) // empty')
+              if [[ -z "$run_id" ]]; then
+                (( SECONDS < find_deadline )) && continue
+                echo "::error::no remote run found within 10 minutes (correlation id $cid)"
+                break
+              fi
+              echo "Remote run: https://github.com/$TARGET_REPO/actions/runs/$run_id"
+            fi
+            read -r status conclusion < <(gh run view "$run_id" -R "$TARGET_REPO" \
+              --json status,conclusion --jq '"\(.status) \(.conclusion // "")"') || continue
+            [[ "$status" == completed ]] && break
+          done
+
+          url="https://github.com/$TARGET_REPO/actions/runs/$run_id"
+          {
+            echo "## LND regression"
+            echo "- Image: \`$IMAGE\`"
+            echo "- Correlation id: \`$cid\`"
+            if [[ -z "$run_id" ]]; then
+              echo "- Result: **no remote run found**"
+            else
+              echo "- Remote run: $url"
+              echo "- Result: **${conclusion:-timed out (status $status)}**"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          [[ -n "$run_id" && "$status" == completed && "$conclusion" == success ]] || {
+            echo "::error::remote regression run did not succeed: ${run_id:-not found} ${conclusion:-$status}"
+            exit 1
+          }
